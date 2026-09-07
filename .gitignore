@@ -1,0 +1,22 @@
+# Dependency directories
+node_modules/
+
+# TypeScript build outputs
+dist/
+build/
+out/
+.tsbuildinfo
+
+# Environmental variables / Secrets
+.env
+.env.local
+*.env
+
+# Logs
+*.log
+logs/
+
+# IDE and Editor configs
+.vscode/
+.idea/
+*.suo
