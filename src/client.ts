@@ -1,10 +1,9 @@
-// client.ts
-import { EventSource } from 'eventsource';
+import {EventSource} from 'eventsource';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const RELAY_URL = process.env.RELAY_URL || 'http://localhost:3000/events?consumer=laptop-client';
-// Target path for your local log (e.g., inside your Jekyll repository or personal notes)
+// Resolve absolute path in the project root
 const LOG_FILE = path.resolve(process.cwd(), 'activity.md');
 
 function formatMarkdownEvent(eventType: string, payload: any): string | null {
@@ -18,7 +17,7 @@ function formatMarkdownEvent(eventType: string, payload: any): string | null {
     case 'push': {
       const branch = (payload.ref || '').replace('refs/heads/', '');
       const commits = payload.commits || [];
-      if (commits.length === 0) return null; // Skip branch deletion or empty pushes
+      if (commits.length === 0) return null;
 
       const commitLines = commits
         .map((c: any) => `  - [\`${c.id.substring(0, 7)}\`] ${c.message.split('\n')[0]}`)
@@ -52,7 +51,6 @@ function formatMarkdownEvent(eventType: string, payload: any): string | null {
 function appendToDailyLog(markdownEntry: string) {
   const dateHeading = `## ${new Date().toISOString().split('T')[0]}\n\n`;
 
-  // Create file or write date header if file doesn't exist
   if (!fs.existsSync(LOG_FILE)) {
     fs.writeFileSync(LOG_FILE, `# Daily Activity Log\n\n${dateHeading}`, 'utf-8');
   }
@@ -60,14 +58,9 @@ function appendToDailyLog(markdownEntry: string) {
   fs.appendFileSync(LOG_FILE, markdownEntry, 'utf-8');
 }
 
-const es = new EventSource(RELAY_URL);
-
-es.onopen = () => console.log('Connected to webhook relay.');
-es.onerror = (err) => console.error('Connection dropped, reconnecting...', err);
-
-es.onmessage = (event) => {
+function processRawData(dataString: string) {
   try {
-    const { eventType, payload } = JSON.parse(event.data);
+    const { eventType, payload } = JSON.parse(dataString);
     const formatted = formatMarkdownEvent(eventType, payload);
 
     if (formatted) {
@@ -77,4 +70,22 @@ es.onmessage = (event) => {
   } catch (err) {
     console.error('Failed to parse event data:', err);
   }
+}
+
+const es = new EventSource(RELAY_URL);
+
+es.onopen = () => console.log('Connected to webhook relay.');
+es.onerror = (err) => console.error('Connection dropped, reconnecting...', err);
+
+// 1. Fallback for unnamed events
+es.onmessage = (event) => {
+  processRawData(event.data);
 };
+
+// 2. Listen specifically for GitHub named events
+const eventTypes = ['push', 'pull_request', 'issues', 'ping', 'release', 'star'];
+for (const type of eventTypes) {
+  es.addEventListener(type, (event: any) => {
+    processRawData(event.data);
+  });
+}
