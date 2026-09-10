@@ -20,18 +20,26 @@ app.get('/', (_req, res) => {
 });
 
 app.get('/events', async (req, res) => {
-  // 1. Ensure consumer group exists before consuming
   await ensureConsumerGroup();
 
-  // 2. Set headers required for Server-Sent Events
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  // Unique consumer name per connected SSE client
-  const consumerId = `client-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  console.log(`SSE client connected: ${consumerId}`);
+  // 1. Use a stable consumer name so the client recovers its own pending history
+  // Accepts a name from the client via query ?consumer=..., or falls back to 'laptop-client'
+  const consumerId =
+    (req.query.consumer as string) ||
+    (req.headers['x-consumer-id'] as string) ||
+    'laptop-client';
+
+  // Read the Last-Event-ID sent by the SSE client on reconnect (if available)
+  const lastEventIdHeader = req.headers['last-event-id'] as string | undefined;
+
+  console.log(
+    `SSE client connected: ${consumerId} (Last-Event-ID: ${lastEventIdHeader ?? 'none'})`
+  );
 
   let isConnected = true;
 
@@ -40,17 +48,66 @@ app.get('/events', async (req, res) => {
     console.log(`SSE client disconnected: ${consumerId}`);
   });
 
-  // Keep-alive heartbeat every 15s to keep NAT/tunnels alive
   const heartbeatTimer = setInterval(() => {
     if (!isConnected) return;
     res.write(': ping\n\n');
   }, 15000);
 
-  // 3. Consumer stream loop
+  // Helper to serialize and write an SSE event frame
+  const sendEvent = async (id: string, fields: Record<string, string>) => {
+    res.write(`id: ${id}\n`);
+    res.write(`event: ${fields.eventType}\n`);
+    res.write(
+      `data: ${JSON.stringify({
+        deliveryId: fields.deliveryId,
+        eventType: fields.eventType,
+        payload: JSON.parse(fields.payload!),
+      })}\n\n`
+    );
+
+    // Only acknowledge from the PEL once flushed
+    await redis.xAck(STREAM_KEY, GROUP_NAME, id);
+    console.log(`Delivered and ACKed stream event ${id} to ${consumerId}`);
+  };
+
   try {
+    // 2. PHASE A: Drain unacknowledged / pending messages from the PEL
+    // Passing '0' returns entries in this consumer's Pending Entries List
+    let checkingPending = true;
+
+    while (isConnected && checkingPending) {
+      const pendingResponse = await redis.xReadGroup(
+        GROUP_NAME,
+        consumerId,
+        [{ key: STREAM_KEY, id: '0' }],
+        { COUNT: 10 }
+      );
+
+      const messages = pendingResponse?.[0]?.messages || [];
+
+      if (messages.length === 0) {
+        // All pending items have been replayed and ACKed
+        checkingPending = false;
+        break;
+      }
+
+      for (const msg of messages) {
+        if (!isConnected) break;
+
+        // If the client already acknowledged receiving up to Last-Event-ID,
+        // we can ACK and skip sending it again
+        if (lastEventIdHeader && msg.id <= lastEventIdHeader) {
+          await redis.xAck(STREAM_KEY, GROUP_NAME, msg.id);
+          continue;
+        }
+
+        await sendEvent(msg.id, msg.message);
+      }
+    }
+
+    // 3. PHASE B: Listen for new incoming events using '>'
     while (isConnected) {
-      // Blocking read up to 2 seconds per batch
-      const response = await redis.xReadGroup(
+      const liveResponse = await redis.xReadGroup(
         GROUP_NAME,
         consumerId,
         [{ key: STREAM_KEY, id: '>' }],
@@ -59,31 +116,19 @@ app.get('/events', async (req, res) => {
 
       if (!isConnected) break;
 
-      if (!response || response.length === 0) {
+      if (!liveResponse || liveResponse.length === 0) {
         continue;
       }
 
-      for (const stream of response) {
-        for (const message of stream.messages) {
-          const { id, message: fields } = message;
-
-          // SSE format: id, event name, data payload, followed by double newline
-          res.write(`id: ${id}\n`);
-          res.write(`event: ${fields.eventType}\n`);
-          res.write(`data: ${JSON.stringify({
-            deliveryId: fields.deliveryId,
-            eventType: fields.eventType,
-            payload: JSON.parse(fields.payload)
-          })}\n\n`);
-
-          // Only acknowledge once written to the client stream buffer
-          await redis.xAck(STREAM_KEY, GROUP_NAME, id);
-          console.log(`Delivered and ACKed stream event ${id} to ${consumerId}`);
+      for (const stream of liveResponse) {
+        for (const msg of stream.messages) {
+          if (!isConnected) break;
+          await sendEvent(msg.id, msg.message);
         }
       }
     }
   } catch (err) {
-    console.error(`Error streaming to client ${consumerId}:`, err);
+    console.error(`Streaming error for ${consumerId}:`, err);
   } finally {
     clearInterval(heartbeatTimer);
     if (!res.writableEnded) {
