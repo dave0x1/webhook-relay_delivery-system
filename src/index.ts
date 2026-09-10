@@ -2,7 +2,8 @@
 import express, { type Express } from 'express';
 import crypto from 'node:crypto';
 import 'dotenv/config';
-import { redis, STREAM_KEY } from './redis.js';
+import { redis, STREAM_KEY, GROUP_NAME } from './redis.js';
+import { ensureConsumerGroup } from './initGroup.js';
 
 const app: Express = express();
 
@@ -16,6 +17,79 @@ app.use(
 
 app.get('/', (_req, res) => {
   res.send('Hello, World!');
+});
+
+app.get('/events', async (req, res) => {
+  // 1. Ensure consumer group exists before consuming
+  await ensureConsumerGroup();
+
+  // 2. Set headers required for Server-Sent Events
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // Unique consumer name per connected SSE client
+  const consumerId = `client-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  console.log(`SSE client connected: ${consumerId}`);
+
+  let isConnected = true;
+
+  req.on('close', () => {
+    isConnected = false;
+    console.log(`SSE client disconnected: ${consumerId}`);
+  });
+
+  // Keep-alive heartbeat every 15s to keep NAT/tunnels alive
+  const heartbeatTimer = setInterval(() => {
+    if (!isConnected) return;
+    res.write(': ping\n\n');
+  }, 15000);
+
+  // 3. Consumer stream loop
+  try {
+    while (isConnected) {
+      // Blocking read up to 2 seconds per batch
+      const response = await redis.xReadGroup(
+        GROUP_NAME,
+        consumerId,
+        [{ key: STREAM_KEY, id: '>' }],
+        { COUNT: 5, BLOCK: 2000 }
+      );
+
+      if (!isConnected) break;
+
+      if (!response || response.length === 0) {
+        continue;
+      }
+
+      for (const stream of response) {
+        for (const message of stream.messages) {
+          const { id, message: fields } = message;
+
+          // SSE format: id, event name, data payload, followed by double newline
+          res.write(`id: ${id}\n`);
+          res.write(`event: ${fields.eventType}\n`);
+          res.write(`data: ${JSON.stringify({
+            deliveryId: fields.deliveryId,
+            eventType: fields.eventType,
+            payload: JSON.parse(fields.payload)
+          })}\n\n`);
+
+          // Only acknowledge once written to the client stream buffer
+          await redis.xAck(STREAM_KEY, GROUP_NAME, id);
+          console.log(`Delivered and ACKed stream event ${id} to ${consumerId}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Error streaming to client ${consumerId}:`, err);
+  } finally {
+    clearInterval(heartbeatTimer);
+    if (!res.writableEnded) {
+      res.end();
+    }
+  }
 });
 
 app.post('/webhook', async (req, res) => {
