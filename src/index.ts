@@ -1,107 +1,91 @@
-import express, {type Express, type Response, type Request} from "express";
+// index.ts
+import express, { type Express } from 'express';
 import crypto from 'node:crypto';
 import 'dotenv/config';
-import { createClient } from 'redis';
+import { redis, STREAM_KEY } from './redis.js';
 
 const app: Express = express();
-const redisUrl = process.env.REDIS_URL;
-if (!redisUrl) {
-    throw new Error('REDIS_URL not set');
-}
-const redis = createClient({ url: redisUrl });
-await redis.connect();
 
-app.use(express.json({ verify: (req, res, buf) => {
-    (req as any).rawBody = buf;
-},}));
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as any).rawBody = buf;
+    },
+  })
+);
 
-async function isDuplicate(deliveryId: string): Promise<boolean> {
-    const result = await redis.set(
-        `webhook:delivery:${deliveryId}`,
-        '1',
-        {
-            NX: true,
-            EX: 60 * 60 * 24 * 3 // 3 days, matching GitHub's redelivery window
-        }
-    );
-
-    // result is 'OK' if the key was newly set (not a duplicate)
-    // result is null if the key already existed (it IS a duplicate)
-    return result === null;
-}
-
-app.get('/', (req, res) => {
-    const secret = process.env.WEBHOOK_SECRET;
-    console.log(JSON.stringify(secret));
-    res.send("Hello, World!");
-})
+app.get('/', (_req, res) => {
+  res.send('Hello, World!');
+});
 
 app.post('/webhook', async (req, res) => {
-    const signature = req.headers["x-hub-signature-256"];
-    const secret = process.env.WEBHOOK_SECRET;
-    const deliveryId = req.headers["x-github-delivery"];
+  const signature = req.headers['x-hub-signature-256'];
+  const secret = process.env.WEBHOOK_SECRET;
+  const deliveryId = req.headers['x-github-delivery'];
+  const eventType = req.headers['x-github-event'];
 
-    if (!secret) {
-        console.error("WEBHOOK_SECRET not set");
-        return res.status(500).send('server misconfigured');
-    }
+  if (!secret) {
+    console.error('WEBHOOK_SECRET not set');
+    return res.status(500).send('server misconfigured');
+  }
 
-    if (typeof signature !== 'string') {
-        return res.status(401).send('missing signature');
-    }
+  if (typeof signature !== 'string') {
+    return res.status(401).send('missing signature');
+  }
 
-    const expected = 'sha256=' + crypto
-        .createHmac('sha256', secret)
-        .update((req as any).rawBody)
-        .digest('hex');
+  const expected =
+    'sha256=' +
+    crypto
+      .createHmac('sha256', secret)
+      .update((req as any).rawBody)
+      .digest('hex');
 
-    const expectedBuf = Buffer.from(expected);
-    const signatureBuf = Buffer.from(signature);
+  const expectedBuf = Buffer.from(expected);
+  const signatureBuf = Buffer.from(signature);
 
-    if (
-        expectedBuf.length !== signatureBuf.length ||
-        !crypto.timingSafeEqual(expectedBuf, signatureBuf)
-    ) {
-        return res.status(401).send('invalid signature');
-    }
+  if (
+    expectedBuf.length !== signatureBuf.length ||
+    !crypto.timingSafeEqual(expectedBuf, signatureBuf)
+  ) {
+    return res.status(401).send('invalid signature');
+  }
 
-    if (typeof deliveryId !== 'string') {
-        return res.status(400).send('missing delivery id');
-    }
+  if (typeof deliveryId !== 'string') {
+    return res.status(400).send('missing delivery id');
+  }
 
-    if (await isDuplicate(deliveryId)) {
-        console.log(`Duplicate delivery ${deliveryId}, skipping`);
-        return res.status(200).send('ok'); // still 200 — don't make GitHub think this failed
-    }
+  if (typeof eventType !== 'string') {
+    return res.status(400).send('missing event type');
+  }
 
-    const eventType = req.headers["x-github-event"];
+  // 1. Claim delivery ID atomically with 3-day TTL
+  const dedupKey = `webhook:delivery:${deliveryId}`;
+  const claimed = await redis.set(dedupKey, '1', {
+    NX: true,
+    EX: 60 * 60 * 24 * 3,
+  });
 
-    if (typeof eventType !== 'string') {
-        return res.status(400).send('missing event type');
-    }
+  if (claimed === null) {
+    console.log(`Duplicate delivery ${deliveryId}, skipping`);
+    return res.status(200).send('ok');
+  }
 
-    const claimed = await redis.set(`webhook:delivery:${deliveryId}`, '1', { NX: true, EX: 60 * 60 * 24 * 3 });
-
-    if (claimed === null) {
-        // duplicate — already claimed
-        return res.status(200).send('ok');
-    }
-
-    try {
-    await redis.xAdd('webhook:events', '*', {
-        deliveryId,
-        eventType,
-        payload: JSON.stringify(req.body)
+  // 2. Queue into Redis Stream, releasing claim if XADD fails
+  try {
+    await redis.xAdd(STREAM_KEY, '*', {
+      deliveryId,
+      eventType,
+      payload: JSON.stringify(req.body),
     });
-    } catch (err) {
-        await redis.del(`webhook:delivery:${deliveryId}`); // release the claim
-        console.error('XADD failed, released claim', err);
-        return res.status(500).send('failed to queue event');
-    }
+  } catch (err) {
+    await redis.del(dedupKey);
+    console.error('XADD failed, released claim', err);
+    return res.status(500).send('failed to queue event');
+  }
 
-    res.status(200).send('ok');
-    console.log(`Queued ${eventType} event ${deliveryId}`);
-})
+  console.log(`Queued ${eventType} event ${deliveryId}`);
+  return res.status(200).send('ok');
+});
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
